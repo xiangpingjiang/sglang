@@ -45,7 +45,7 @@ use crate::message::multimodal::MmItem;
 use crate::message::request::{GenerateRequest, MmData};
 use crate::message::response::ChunkExtras;
 use crate::message::sampling::SamplingParams;
-use crate::message::types::OneOrMany;
+use crate::message::types::{OneOrMany, TokenIds};
 
 pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new().route("/v1/chat/completions", post(chat_completions))
@@ -193,21 +193,18 @@ async fn chat_completions(
         || state.server_args.stream_response_default_include_usage;
     let mut submitted = Vec::with_capacity(choices_per_prompt);
 
-    let starts_in_reasoning = starts_in_reasoning(reasoning_parser.as_deref(), &prompt);
-    let mut prompt = Some(prompt);
+    let starts_in_reasoning = starts_in_reasoning(reasoning_parser.as_deref(), &prompt.text);
+    let images = prompt.images.unwrap_or(images);
+    let (text, input_ids) = match prompt.input_ids {
+        Some(ids) => (None, Some(ids)),
+        None => (Some(prompt.text), None),
+    };
     for index in 0..choices_per_prompt {
         let rid = Rid::from_client(&format!("{response_id}-{index}"));
-        let choice_prompt = if index + 1 == choices_per_prompt {
-            prompt.take().expect("last chat choice owns the prompt")
-        } else {
-            prompt
-                .as_ref()
-                .expect("chat prompt exists until the last choice")
-                .clone()
-        };
         let native = GenerateRequest {
             rid: rid.clone(),
-            text: Some(choice_prompt),
+            text: text.clone(),
+            input_ids: input_ids.clone(),
             // Rendered templates own their special tokens — the pool must not
             // add another BOS/EOS (Python's `add_special_tokens=False`).
             skip_special_tokens: true,
@@ -294,15 +291,22 @@ fn chat_images<T: serde::Serialize>(
         .collect())
 }
 
+/// A rendered chat prompt. It is submitted as text — the tokenizer pool encodes
+/// it (with `skip_special_tokens`, since the template owns its special tokens) —
+/// unless its formatter encoded it, with its images in the formatter's order.
+pub(super) struct ChatPrompt {
+    text: String,
+    input_ids: Option<TokenIds>,
+    images: Option<Vec<MmItem>>,
+}
+
 /// Render the chat template for an OpenAI request, mapping a missing
-/// formatter or a render failure to the standard 400. The rendered prompt is
-/// submitted as text — the tokenizer pool encodes it (with
-/// `skip_special_tokens`, since the template owns its special tokens).
+/// formatter or a render failure to the standard 400.
 pub(super) async fn prepare_chat_request(
     state: &AppState,
     mut request: CreateChatCompletionRequest,
     kwargs: Option<&ChatTemplateKwargs>,
-) -> Result<(CreateChatCompletionRequest, String), Response> {
+) -> Result<(CreateChatCompletionRequest, ChatPrompt), Response> {
     let Some(formatter) = state.chat_formatter.clone() else {
         return Err(openai_error(
             StatusCode::BAD_REQUEST,
@@ -315,7 +319,19 @@ pub(super) async fn prepare_chat_request(
     // token-id stop cannot be merged into the string list (Python has no such
     // field), so it is kept alone.
     merge_template_stops(&mut request, &formatter);
-    let prompt = formatter.render(&request, kwargs).map_err(|error| {
+    let prompt = match formatter.encode(&request, kwargs) {
+        Some(encoded) => encoded.map(|encoded| ChatPrompt {
+            text: encoded.text,
+            input_ids: Some(encoded.ids.into_iter().map(i64::from).collect()),
+            images: Some(encoded.images.into_iter().map(MmItem::Source).collect()),
+        }),
+        None => formatter.render(&request, kwargs).map(|text| ChatPrompt {
+            text,
+            input_ids: None,
+            images: None,
+        }),
+    };
+    let prompt = prompt.map_err(|error| {
         openai_error(
             StatusCode::BAD_REQUEST,
             format!("chat template render failed: {error}"),

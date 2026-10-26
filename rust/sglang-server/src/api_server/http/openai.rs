@@ -50,6 +50,11 @@ pub(super) fn load_chat_support(server_args: &ServerArgs) -> Option<ChatFormatte
     if server_args.skip_tokenizer_init || server_args.tokenizer_path.is_empty() {
         return None;
     }
+    if let Some(formatter) = deepseek_chat_formatter(server_args) {
+        return formatter
+            .inspect_err(|error| tracing::warn!(%error, "OpenAI chat completions disabled"))
+            .ok();
+    }
     let config_file = tokenizer::resolve_model_file(
         &server_args.tokenizer_path,
         server_args.revision.as_deref(),
@@ -74,6 +79,33 @@ pub(super) fn load_chat_support(server_args: &ServerArgs) -> Option<ChatFormatte
             None
         }
     }
+}
+
+/// DeepSeek-V4 and V4.1 render and encode through deepseek-recipe with the
+/// checkpoint's `tokenizer.json`, as Python's `serving_deepseek_recipe.py`.
+fn deepseek_chat_formatter(server_args: &ServerArgs) -> Option<Result<ChatFormatter, String>> {
+    let v41 = match server_args.model_config.model_type.as_deref() {
+        Some("deepseek_v4") => false,
+        Some("deepseek_v41") => true,
+        _ => return None,
+    };
+    if server_args.chat_template.is_some() {
+        return None;
+    }
+    let tokenizer = tokenizer::resolve_model_file(
+        &server_args.tokenizer_path,
+        server_args.revision.as_deref(),
+        "tokenizer.json",
+    )
+    .and_then(|file| std::fs::read_to_string(file).ok());
+    Some(
+        tokenizer
+            .ok_or_else(|| "DeepSeek needs the checkpoint's tokenizer.json".to_string())
+            .and_then(|tokenizer| {
+                sglang_processor::ChatFormatter::deepseek_v4(v41, Some(&tokenizer))
+            })
+            .map(ChatFormatter::DeepSeek),
+    )
 }
 
 fn unix_seconds() -> u64 {

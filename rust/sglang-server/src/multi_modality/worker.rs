@@ -5,9 +5,9 @@
 use std::sync::Arc;
 
 use sglang_mm::pipeline::{Tensor, TensorData};
-use sglang_processor::MmOutput;
 use sglang_processor::dynamo_multimodal::processor::{self as dynamo, PositionOutput};
 use sglang_processor::dynamo_multimodal::registry::ProcessorSpec;
+use sglang_processor::{MmOutput, MmPipelineSpec};
 
 use super::deepseek_image::RecipeImages;
 use super::encoded::{MRope, MmEncodedEntry, MmEncodedItem, MmMeta, MmMetaValue, MmModality};
@@ -231,9 +231,12 @@ pub struct MmContext {
 
 impl MmContext {
     pub fn new(spec: MmSpec) -> Result<Self, String> {
-        let recipe = matches!(spec.pipeline, ProcessorSpec::DeepseekV41(_))
-            .then(RecipeImages::new)
-            .transpose()?;
+        let recipe = matches!(
+            spec.pipeline,
+            MmPipelineSpec::Dynamo(ProcessorSpec::DeepseekV41(_))
+        )
+        .then(RecipeImages::new)
+        .transpose()?;
         let pipeline =
             sglang_processor::MmProcessor::from_spec(spec.pipeline).map_err(|e| e.to_string())?;
         Ok(Self {

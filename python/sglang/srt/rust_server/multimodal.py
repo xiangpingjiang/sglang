@@ -133,6 +133,46 @@ def _resolve_qwen_vl(*, processor, hf_config, feature_shm) -> Optional[RustMmSpe
     )
 
 
+_GLM5_NEXT_RESAMPLE = {
+    "Glm5NextImageProcessor": "aten_u8",
+    "Glm5NextImageProcessorPil": "pil",
+}
+
+
+def _resolve_glm5_next(*, processor, hf_config, feature_shm) -> Optional[RustMmSpec]:
+    image_processor = getattr(processor, "image_processor", None)
+    resample = _rust_resample(image_processor, _GLM5_NEXT_RESAMPLE)
+    image_overrides = _image_overrides(
+        frozenset(("min_image_tokens", "max_image_tokens"))
+    )
+    if resample is None or image_overrides is None:
+        return None
+    knobs = ("patch_size", "merge_size", "temporal_patch_size", "patch_expand_factor")
+    tokens = ("min_image_tokens", "max_image_tokens")
+    pipeline = {knob: getattr(image_processor, knob) for knob in knobs}
+    pipeline.update(
+        {
+            name: image_overrides.get(name, getattr(image_processor, name))
+            for name in tokens
+        }
+    )
+    pipeline.update(
+        image_token_id=hf_config.image_token_id,
+        video_token_id=hf_config.video_token_id,
+        image_mean=[float(x) for x in image_processor.image_mean],
+        image_std=[float(x) for x in image_processor.image_std],
+        resample=resample,
+    )
+    return RustMmSpec(
+        family="glm5_next",
+        feature_shm=feature_shm,
+        pipeline=pipeline,
+        image_token_id=hf_config.image_token_id,
+        # `Glm4vImageProcessor` expands video with the image token too.
+        video_token_id=hf_config.image_token_id,
+    )
+
+
 def _resolve_deepseek_v41(*, processor, hf_config, feature_shm) -> Optional[RustMmSpec]:
     # Rust resizes with deepseek-recipe-image, whose V4.1 grid is fixed: 14-pixel
     # patches under a 3x3 downsample.
@@ -168,6 +208,12 @@ RUST_MM_FAMILIES: Tuple[RustMmFamily, ...] = (
             )
         ),
         resolve=_resolve_qwen_vl,
+    ),
+    RustMmFamily(
+        name="glm5_next",
+        mm_processor="sglang.srt.multimodal.processors.glm4v:Glm4vImageProcessor",
+        model_types=frozenset(("glm5_next",)),
+        resolve=_resolve_glm5_next,
     ),
     RustMmFamily(
         name="deepseek_v41",
